@@ -23,7 +23,8 @@ jobs:
       - name: Deploy
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa-key.json
-        run: firebase deploy --only functions --project kwora-massanger --non-force
+          FIREBASE_CLI_EXPERIMENTS: webframeworks
+        run: firebase deploy --only functions --project kwora-massanger --force
       - name: Cleanup
         if: always()
         run: rm -f "$GITHUB_WORKSPACE/sa-key.json"
