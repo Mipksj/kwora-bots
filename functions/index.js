@@ -44,16 +44,50 @@ async function sendCodeMail(to, code) {
   }
 }
 
-async function accountsOf(mailLow) {
+async function accountsOf(mailLow, withAuth) {
   const s = await db.collection("users").where("mailLow", "==", mailLow).limit(6).get();
   return s.docs
     .map((d) => ({ uid: d.id, ...d.data() }))
     .filter((u) => !u.isBot)
-    .map((u) => ({
-      uid: u.uid, nick: u.nick || "", name: u.name || u.nick || "",
-      photo: u.photo || "", verified: !!u.verified, banned: !!u.banned
-    }));
+    .map((u) => {
+      const base = {
+        uid: u.uid, nick: u.nick || "", name: u.name || u.nick || "",
+        photo: u.photo || "", verified: !!u.verified, banned: !!u.banned
+      };
+      if (withAuth) {
+        base.authMail = u.authMail || ((u.nickLow || "") + "@kwora.id");
+        base.mail = u.mail || "";
+        base.mailLow = u.mailLow || "";
+        base.nickLow = u.nickLow || "";
+      }
+      return base;
+    });
 }
+
+/* поиск аккаунта при входе (до авторизации) — по почте или нику */
+exports.loginLookup = onCall(async (req) => {
+  const id = String((req.data && req.data.id) || "").trim().toLowerCase().replace(/^@/, "");
+  if (!id) throw new HttpsError("invalid-argument", "Введите ник или почту.");
+
+  if (id.includes("@") && id.includes(".")) {
+    const accounts = await accountsOf(id, true);
+    if (!accounts.length) throw new HttpsError("not-found", "Аккаунт с такой почтой не найден.");
+    return { kind: "mail", accounts };
+  }
+
+  const q = await db.collection("users").where("nickLow", "==", id).limit(1).get();
+  const u = q.empty ? null : q.docs[0].data();
+  if (!u || u.isBot) throw new HttpsError("not-found", "Ник @" + id + " не найден.");
+  return {
+    kind: "nick",
+    account: {
+      uid: u.uid, nick: u.nick || "", name: u.name || u.nick || "",
+      photo: u.photo || "", verified: !!u.verified, banned: !!u.banned,
+      authMail: u.authMail || ((u.nickLow || "") + "@kwora.id"),
+      mail: u.mail || "", mailLow: u.mailLow || "", nickLow: u.nickLow || ""
+    }
+  };
+});
 
 /* шаг 1: выслать код на почту */
 exports.mailAuthStart = onCall(async (req) => {
