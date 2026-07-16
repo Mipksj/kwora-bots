@@ -1,10 +1,124 @@
+/**
+ * Kwora server: боты + почтовая авторизация (забыл пароль / вход без пароля).
+ */
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { getAuth } = require("firebase-admin/auth");
+const crypto = require("crypto");
 
 initializeApp();
 const db = getFirestore();
+const adminAuth = getAuth();
 
+/* ---------- EmailJS (отправка кода с сервера) ---------- */
+const EJS = {
+  service: "service_345gudin",
+  template: "template_ny4ohac",
+  publicKey: "R4vZz7b0YlLVR7PHe",
+  privateKey: "C__BHXLbOfDkJkW3NItyb"
+};
+
+const sha = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
+const sixDigits = () => String(Math.floor(100000 + Math.random() * 900000));
+
+async function sendCodeMail(to, code) {
+  const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      service_id: EJS.service,
+      template_id: EJS.template,
+      user_id: EJS.publicKey,
+      accessToken: EJS.privateKey,
+      template_params: {
+        passcode: code, code,
+        email: to, to_email: to, user_email: to, reply_to: to, to_name: to
+      }
+    })
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new HttpsError("internal", "Письмо не отправилось: " + t.slice(0, 120));
+  }
+}
+
+async function accountsOf(mailLow) {
+  const s = await db.collection("users").where("mailLow", "==", mailLow).limit(6).get();
+  return s.docs
+    .map((d) => ({ uid: d.id, ...d.data() }))
+    .filter((u) => !u.isBot)
+    .map((u) => ({
+      uid: u.uid, nick: u.nick || "", name: u.name || u.nick || "",
+      photo: u.photo || "", verified: !!u.verified, banned: !!u.banned
+    }));
+}
+
+/* шаг 1: выслать код на почту */
+exports.mailAuthStart = onCall(async (req) => {
+  const mail = String((req.data && req.data.mail) || "").trim();
+  const mailLow = mail.toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mailLow)) {
+    throw new HttpsError("invalid-argument", "Почта написана неверно.");
+  }
+  const accs = await accountsOf(mailLow);
+  if (!accs.length) {
+    throw new HttpsError("not-found", "На эту почту нет аккаунтов.");
+  }
+  const code = sixDigits();
+  await db.collection("mailAuth").doc(mailLow).set({
+    hash: sha(code), exp: Date.now() + 10 * 60 * 1000, tries: 0,
+    at: FieldValue.serverTimestamp()
+  });
+  await sendCodeMail(mail, code);
+  return { ok: true };
+});
+
+/* шаг 2: проверить код; action = list | login | reset */
+exports.mailAuthConfirm = onCall(async (req) => {
+  const d = req.data || {};
+  const mailLow = String(d.mail || "").trim().toLowerCase();
+  const code = String(d.code || "").trim();
+  const action = String(d.action || "list");
+
+  const ref = db.collection("mailAuth").doc(mailLow);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("failed-precondition", "Сначала запросите код.");
+  const rec = snap.data();
+
+  if (Date.now() > rec.exp) { await ref.delete().catch(() => {}); throw new HttpsError("deadline-exceeded", "Код истёк. Запросите новый."); }
+  if ((rec.tries || 0) >= 5) { await ref.delete().catch(() => {}); throw new HttpsError("resource-exhausted", "Слишком много попыток. Запросите новый код."); }
+
+  if (sha(code) !== rec.hash) {
+    await ref.update({ tries: FieldValue.increment(1) }).catch(() => {});
+    throw new HttpsError("permission-denied", "Неверный код.");
+  }
+
+  if (action === "list") {
+    return { accounts: await accountsOf(mailLow) };
+  }
+
+  const uid = String(d.uid || "");
+  const accs = await accountsOf(mailLow);
+  const acc = accs.find((a) => a.uid === uid);
+  if (!acc) throw new HttpsError("permission-denied", "Аккаунт не принадлежит этой почте.");
+  if (acc.banned) throw new HttpsError("permission-denied", "Этот аккаунт заблокирован.");
+
+  if (action === "reset") {
+    const np = String(d.newPassword || "");
+    if (np.length < 6) throw new HttpsError("invalid-argument", "Пароль короче 6 символов.");
+    await adminAuth.updateUser(uid, { password: np });
+  } else if (action !== "login") {
+    throw new HttpsError("invalid-argument", "Неизвестное действие.");
+  }
+
+  await ref.delete().catch(() => {});
+  const token = await adminAuth.createCustomToken(uid);
+  return { token };
+});
+
+/* ---------- боты (без изменений) ---------- */
 function norm(s) {
   return String(s == null ? "" : s).trim().toLowerCase();
 }
