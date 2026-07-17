@@ -96,10 +96,6 @@ exports.mailAuthStart = onCall(async (req) => {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mailLow)) {
     throw new HttpsError("invalid-argument", "Почта написана неверно.");
   }
-  const accs = await accountsOf(mailLow);
-  if (!accs.length) {
-    throw new HttpsError("not-found", "На эту почту нет аккаунтов.");
-  }
   const code = sixDigits();
   await db.collection("mailAuth").doc(mailLow).set({
     hash: sha(code), exp: Date.now() + 10 * 60 * 1000, tries: 0,
@@ -133,6 +129,33 @@ exports.mailAuthConfirm = onCall(async (req) => {
     return { accounts: await accountsOf(mailLow) };
   }
 
+  if (action === "register") {
+    const nick = String(d.nick || "").trim().replace(/^@/, "");
+    const low = nick.toLowerCase();
+    const name = String(d.name || "").trim().slice(0, 32) || nick;
+    if (!/^[a-z0-9_]{3,20}$/.test(low)) {
+      throw new HttpsError("invalid-argument", "Ник: 3–20 знаков, латиница, цифры и _");
+    }
+    const exist = await accountsOf(mailLow);
+    if (exist.length >= 4) {
+      throw new HttpsError("resource-exhausted", "На эту почту уже 4 аккаунта.");
+    }
+    const taken = await db.collection("users").where("nickLow", "==", low).limit(1).get();
+    if (!taken.empty) throw new HttpsError("already-exists", "Такой ник занят.");
+
+    const user = await adminAuth.createUser({});
+    await db.collection("users").doc(user.uid).set({
+      uid: user.uid, nick, nickLow: low, name,
+      mail: mailLow, mailLow,
+      photo: "", bio: "", whoCanWrite: "all",
+      verified: false, verifyAsked: false, badges: [], banned: false,
+      createdAt: FieldValue.serverTimestamp()
+    });
+    await ref.delete().catch(() => {});
+    const token = await adminAuth.createCustomToken(user.uid);
+    return { token };
+  }
+
   const uid = String(d.uid || "");
   const accs = await accountsOf(mailLow);
   const acc = accs.find((a) => a.uid === uid);
@@ -150,6 +173,32 @@ exports.mailAuthConfirm = onCall(async (req) => {
   await ref.delete().catch(() => {});
   const token = await adminAuth.createCustomToken(uid);
   return { token };
+});
+
+/* выдача значка "bot creator" за первого бота — сервером, после проверки */
+exports.claimBotBadge = onCall(async (req) => {
+  if (!req.auth || !req.auth.uid) {
+    throw new HttpsError("unauthenticated", "Нужен вход в аккаунт.");
+  }
+  const uid = req.auth.uid;
+
+  const own = await db.collection("users").where("botOwner", "==", uid).limit(1).get();
+  if (own.empty) {
+    throw new HttpsError("failed-precondition", "Сначала создайте бота.");
+  }
+
+  const cat = await db.collection("badges").get();
+  const badge = cat.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .find((b) => String(b.name || "").trim().toLowerCase() === "bot creator");
+  if (!badge) {
+    throw new HttpsError("not-found", "Значок 'bot creator' не найден в каталоге.");
+  }
+
+  await db.collection("users").doc(uid).update({
+    badges: FieldValue.arrayUnion(badge.id)
+  });
+  return { ok: true, badgeId: badge.id };
 });
 
 /* ---------- боты (без изменений) ---------- */
