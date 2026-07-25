@@ -64,37 +64,16 @@ async function accountsOf(mailLow, withAuth) {
     });
 }
 
-/* поиск аккаунта при входе (до авторизации) — по почте или нику */
-exports.loginLookup = onCall(async (req) => {
-  const id = String((req.data && req.data.id) || "").trim().toLowerCase().replace(/^@/, "");
-  if (!id) throw new HttpsError("invalid-argument", "Введите ник или почту.");
-
-  if (id.includes("@") && id.includes(".")) {
-    const accounts = await accountsOf(id, true);
-    if (!accounts.length) throw new HttpsError("not-found", "Аккаунт с такой почтой не найден.");
-    return { kind: "mail", accounts };
-  }
-
-  const q = await db.collection("users").where("nickLow", "==", id).limit(1).get();
-  const u = q.empty ? null : q.docs[0].data();
-  if (!u || u.isBot) throw new HttpsError("not-found", "Ник @" + id + " не найден.");
-  return {
-    kind: "nick",
-    account: {
-      uid: u.uid, nick: u.nick || "", name: u.name || u.nick || "",
-      photo: u.photo || "", verified: !!u.verified, banned: !!u.banned,
-      authMail: u.authMail || ((u.nickLow || "") + "@kwora.id"),
-      mail: u.mail || "", mailLow: u.mailLow || "", nickLow: u.nickLow || ""
-    }
-  };
-});
-
 /* шаг 1: выслать код на почту */
 exports.mailAuthStart = onCall(async (req) => {
   const mail = String((req.data && req.data.mail) || "").trim();
   const mailLow = mail.toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mailLow)) {
     throw new HttpsError("invalid-argument", "Почта написана неверно.");
+  }
+  const prev = await db.collection("mailAuth").doc(mailLow).get();
+  if (prev.exists && prev.data().at && (Date.now() - prev.data().at.toMillis() < 60000)) {
+    throw new HttpsError("resource-exhausted", "Код уже отправлен. Подождите минуту.");
   }
   const code = sixDigits();
   await db.collection("mailAuth").doc(mailLow).set({
@@ -143,7 +122,21 @@ exports.mailAuthConfirm = onCall(async (req) => {
     const taken = await db.collection("users").where("nickLow", "==", low).limit(1).get();
     if (!taken.empty) throw new HttpsError("already-exists", "Такой ник занят.");
 
-    const user = await adminAuth.createUser({});
+        const lockRef = db.collection("nicks").doc(low);
+    try {
+      await db.runTransaction(async (t) => {
+        const l = await t.get(lockRef);
+        if (l.exists) throw new HttpsError("already-exists", "Такой ник занят.");
+        t.set(lockRef, { at: Date.now() });
+      });
+    } catch (e) {
+      if (e instanceof HttpsError) throw e;
+      throw new HttpsError("internal", "Не получилось занять ник.");
+    }
+
+    let user;
+    try { user = await adminAuth.createUser({}); }
+    catch (e) { await lockRef.delete().catch(() => {}); throw new HttpsError("internal", "Не получилось создать аккаунт."); }
     await db.collection("users").doc(user.uid).set({
       uid: user.uid, nick, nickLow: low, name,
       mail: mailLow, mailLow,
