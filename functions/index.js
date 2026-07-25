@@ -6,11 +6,13 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getAuth } = require("firebase-admin/auth");
+const { getMessaging } = require("firebase-admin/messaging");
 const crypto = require("crypto");
 
 initializeApp();
 const db = getFirestore();
 const adminAuth = getAuth();
+const fcm = getMessaging();
 
 /* ---------- EmailJS (отправка кода с сервера) ---------- */
 const EJS = {
@@ -275,3 +277,54 @@ exports.onBotMessage = onDocumentCreated(
     );
   }
 );
+
+
+/* ---------- ПУШ-УВЕДОМЛЕНИЯ о новых сообщениях ---------- */
+const APP_URL = "https://mipksj.github.io/kwora/";
+
+exports.pushOnMessage = onDocumentCreated("chats/{chat}/messages/{msg}", async (event) => {
+  const m = event.data ? event.data.data() : null;
+  if (!m || m.sys) return;
+
+  const chatId = event.params.chat;
+  const cs = await db.collection("chats").doc(chatId).get();
+  if (!cs.exists) return;
+  const c = cs.data();
+
+  const to = (c.members || []).filter((u) => u && u !== m.from);
+  if (!to.length) return;
+
+  const snaps = await db.getAll(...to.map((u) => db.collection("users").doc(u)));
+  const tokens = [];
+  const ownerOf = {};
+  snaps.forEach((d) => {
+    const arr = (d.data() || {}).fcmTokens || [];
+    arr.forEach((t) => { if (t && !ownerOf[t]) { tokens.push(t); ownerOf[t] = d.id; } });
+  });
+  if (!tokens.length) return;
+
+  const info = (c.info || {})[m.from] || {};
+  const sender = info.name || info.nick || "Kwora";
+  const what = m.text ? String(m.text).slice(0, 120)
+    : (m.img ? "Фото" : (m.poll ? "Опрос: " + String((m.poll.q || "")).slice(0, 80)
+    : (m.contact ? "Контакт" : "Сообщение")));
+  const title = c.type === "group" ? (c.name || "Группа") : sender;
+  const body = c.type === "group" ? sender + ": " + what : what;
+
+  const res = await fcm.sendEachForMulticast({
+    tokens,
+    data: { title, body, url: APP_URL, chat: chatId },
+    webpush: { headers: { Urgency: "high" }, fcmOptions: { link: APP_URL } }
+  });
+
+  const dead = [];
+  res.responses.forEach((r, i) => {
+    if (!r.success) {
+      const code = (r.error && r.error.code) || "";
+      if (code.includes("registration-token-not-registered") || code.includes("invalid-argument")) dead.push(tokens[i]);
+    }
+  });
+  await Promise.all(dead.map((t) =>
+    db.collection("users").doc(ownerOf[t]).update({ fcmTokens: FieldValue.arrayRemove(t) }).catch(() => {})
+  ));
+});
