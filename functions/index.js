@@ -328,3 +328,49 @@ exports.pushOnMessage = onDocumentCreated("chats/{chat}/messages/{msg}", async (
     db.collection("users").doc(ownerOf[t]).update({ fcmTokens: FieldValue.arrayRemove(t) }).catch(() => {})
   ));
 });
+
+
+/* ---------- ПУШ О ВХОДЯЩЕМ ЗВОНКЕ ---------- */
+exports.pushOnCall = onDocumentCreated("calls/{call}", async (event) => {
+  const d = event.data ? event.data.data() : null;
+  if (!d || !d.to || !d.from) return;
+  if (d.state && d.state !== "ringing") return;
+
+  const [toSnap, fromSnap] = await Promise.all([
+    db.collection("users").doc(d.to).get(),
+    db.collection("users").doc(d.from).get()
+  ]);
+  const tokens = ((toSnap.data() || {}).fcmTokens || []).filter(Boolean);
+  if (!tokens.length) return;
+
+  const fromU = fromSnap.data() || {};
+  const caller = fromU.name || fromU.nick || "Kwora";
+  const kind = d.video ? "Видеозвонок" : "Звонок";
+
+  const res = await fcm.sendEachForMulticast({
+    tokens,
+    data: {
+      type: "call",
+      title: caller,
+      body: kind + "…",
+      url: APP_URL,
+      callId: event.params.call
+    },
+    android: { priority: "high" },
+    webpush: {
+      headers: { Urgency: "high", TTL: "30" },
+      fcmOptions: { link: APP_URL }
+    }
+  });
+
+  const dead = [];
+  res.responses.forEach((r, i) => {
+    if (!r.success) {
+      const code = (r.error && r.error.code) || "";
+      if (code.includes("registration-token-not-registered") || code.includes("invalid-argument")) dead.push(tokens[i]);
+    }
+  });
+  await Promise.all(dead.map((t) =>
+    db.collection("users").doc(d.to).update({ fcmTokens: FieldValue.arrayRemove(t) }).catch(() => {})
+  ));
+});
