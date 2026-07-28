@@ -1,0 +1,145 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function me()   { return request.auth.uid; }
+    function auth() { return request.auth != null; }
+    function admin(){ return auth() && exists(/databases/$(database)/documents/admins/$(me())); }
+
+    function chat(c)   { return get(/databases/$(database)/documents/chats/$(c)).data; }
+    function inChat(c) { return auth() && me() in chat(c).members; }
+    function isGroup(c){ return chat(c).get('type','dm') == 'group'; }
+    function isOwner(c){ return chat(c).get('owner','') == me(); }
+    function peer(c)   { return chat(c).members[0] == me() ? chat(c).members[1] : chat(c).members[0]; }
+
+    function blockedBy(u){ return exists(/databases/$(database)/documents/users/$(u)/blocked/$(me())); }
+    function friendOf(u) { return exists(/databases/$(database)/documents/users/$(u)/friends/$(me())); }
+    function openTo(u)   { return get(/databases/$(database)/documents/users/$(u)).data.get('whoCanWrite','all') == 'all'; }
+    function mayWrite(u) { return !blockedBy(u) && (openTo(u) || friendOf(u)); }
+
+    function callDoc(k){ return get(/databases/$(database)/documents/calls/$(k)).data; }
+    function inCall(k){ return auth() && (callDoc(k).from == me() || callDoc(k).to == me()); }
+
+    function botOwnerOf(uid){ return get(/databases/$(database)/documents/users/$(uid)).data.get('botOwner',''); }
+
+    match /admins/{uid} {
+      allow read:   if me() == uid;
+      allow create: if me() == uid && request.resource.data.key == 'jejfefjfeiwr23eunjedw4r';
+      allow delete: if me() == uid;
+    }
+
+    match /badges/{id} {
+      allow read: if auth();
+      allow write: if admin();
+    }
+
+    match /users/{uid} {
+      allow read: if auth();
+
+      allow create: if (me() == uid && request.resource.data.get('verified', false) == false)
+        || (request.resource.data.get('isBot', false) == true
+            && request.resource.data.get('botOwner','') == me());
+
+      allow update: if admin()
+        || (me() == uid
+            && request.resource.data.get('verified', false) == resource.data.get('verified', false)
+            && request.resource.data.get('badges', []) == resource.data.get('badges', [])
+            && request.resource.data.get('banned', false) == resource.data.get('banned', false))
+        || (resource.data.get('isBot', false) == true && resource.data.get('botOwner','') == me());
+
+      allow delete: if admin()
+        || (resource.data.get('isBot', false) == true && resource.data.get('botOwner','') == me());
+
+      match /rules/{rid} {
+        allow read:  if auth();
+        allow write: if botOwnerOf(uid) == me();
+      }
+
+      match /friends/{fid} {
+        allow read: if me() == uid;
+        allow create: if me() == uid
+          || (me() == fid && exists(/databases/$(database)/documents/users/$(fid)/requests/$(uid)));
+        allow delete: if me() == uid || me() == fid;
+      }
+      match /requests/{from} {
+        allow read: if me() == uid || me() == from;
+        allow create: if me() == from
+          && !exists(/databases/$(database)/documents/users/$(uid)/blocked/$(from));
+        allow delete: if me() == uid || me() == from;
+      }
+      match /invites/{c} {
+        allow read: if me() == uid;
+        allow create: if auth() && me() in chat(c).members
+          && !exists(/databases/$(database)/documents/users/$(uid)/blocked/$(me()));
+        allow delete: if me() == uid;
+      }
+      match /blocked/{bid} {
+        allow read, write: if me() == uid;
+      }
+    }
+
+    match /chats/{c} {
+      allow read:   if auth() && me() in resource.data.members;
+      allow create: if auth() && me() in request.resource.data.members;
+      allow delete: if auth() && (me() in resource.data.members || admin());
+      allow update: if auth() && (
+           admin()
+        || (isOwner(c)
+            && request.resource.data.get('verified', false) == resource.data.get('verified', false))
+        || (me() in resource.data.members
+            && request.resource.data.get('verified', false) == resource.data.get('verified', false)
+            && request.resource.data.get('owner','') == resource.data.get('owner','')
+            && resource.data.members.hasAll(request.resource.data.members)
+            && request.resource.data.members.size() >= resource.data.members.size() - 1)
+        || (exists(/databases/$(database)/documents/users/$(me())/invites/$(c))
+            && request.resource.data.members.hasAll(resource.data.members)
+            && me() in request.resource.data.members
+            && request.resource.data.members.size() == resource.data.members.size() + 1)
+      );
+
+      match /messages/{m} {
+        allow read:   if inChat(c);
+        allow delete: if admin() || isOwner(c)
+          || (inChat(c) && resource.data.from == me());
+        allow create: if inChat(c)
+          && request.resource.data.from == me()
+          && (isGroup(c) || mayWrite(peer(c)));
+        allow update: if inChat(c)
+          && request.resource.data.from == resource.data.from
+          && request.resource.data.get('poll', {}) == resource.data.get('poll', {})
+          && request.resource.data.get('img','') == resource.data.get('img','')
+          && (request.resource.data.get('text','') == resource.data.get('text','')
+              || resource.data.from == me())
+          && (request.resource.data.get('votes', {}) == resource.data.get('votes', {})
+              || request.resource.data.get('votes', {}).diff(resource.data.get('votes', {})).affectedKeys().hasOnly([me()]));
+      }
+
+      match /roles/{r} {
+        allow read:  if inChat(c);
+        allow write: if isOwner(c);
+      }
+
+      match /gcall/{u} {
+        allow read: if inChat(c);
+        allow create, update: if inChat(c) && u == me();
+        allow delete: if inChat(c) && (u == me() || isOwner(c));
+      }
+
+      match /rtc/{k} {
+        allow read, write: if inChat(c);
+        match /{sub}/{x} {
+          allow read, write: if inChat(c);
+        }
+      }
+    }
+
+    match /calls/{k} {
+      allow read:   if auth() && (resource.data.from == me() || resource.data.to == me());
+      allow create: if auth() && request.resource.data.from == me()
+        && mayWrite(request.resource.data.to);
+      allow update, delete: if auth() && (resource.data.from == me() || resource.data.to == me());
+      match /callerCandidates/{x} { allow read, write: if inCall(k); }
+      match /calleeCandidates/{x} { allow read, write: if inCall(k); }
+    }
+  }
+}
