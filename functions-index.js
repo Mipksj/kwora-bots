@@ -305,8 +305,9 @@ exports.pushOnMessage = onDocumentCreated("chats/{chat}/messages/{msg}", async (
   const info = (c.info || {})[m.from] || {};
   const sender = info.name || info.nick || "Kwora";
   const what = m.text ? String(m.text).slice(0, 120)
-    : (m.img ? "Фото" : (m.poll ? "Опрос: " + String((m.poll.q || "")).slice(0, 80)
-    : (m.contact ? "Контакт" : "Сообщение")));
+    : (m.img ? "Фото" : (m.voice ? "Голосовое" : (m.video ? "Видео"
+    : (m.poll ? "Опрос: " + String((m.poll.q || "")).slice(0, 80)
+    : (m.contact ? "Контакт" : "Сообщение")))));
   const title = c.type === "group" ? (c.name || "Группа") : sender;
   const body = c.type === "group" ? sender + ": " + what : what;
 
