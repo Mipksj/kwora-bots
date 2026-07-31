@@ -145,6 +145,13 @@ exports.mailAuthConfirm = onCall(async (req) => {
       verified: false, verifyAsked: false, badges: [], banned: false,
       createdAt: FieldValue.serverTimestamp()
     });
+    {
+      const pw = String((req.data && req.data.newPassword) || "");
+      if (pw) {
+        if (!PASS_RE.test(pw)) throw new HttpsError("invalid-argument", "Пароль: минимум 6 символов, латинские буквы и цифры.");
+        await db.collection("secrets").doc(user.uid).set({ passHash: passHash(user.uid, pw), at: Date.now() });
+      }
+    }
     await ref.delete().catch(() => {});
     const token = await adminAuth.createCustomToken(user.uid);
     return { token };
@@ -403,4 +410,58 @@ exports.changeMyMail = onCall(async (req) => {
   await db.collection("users").doc(uid).update({ mail, mailLow: low });
   await ref.delete().catch(() => {});
   return { ok: true };
+});
+
+
+/* ---------- ПАРОЛЬНЫЙ ВХОД ---------- */
+const PASS_RE = /^(?=.*[A-Za-z])(?=.*\d)[\x21-\x7E]{6,64}$/;
+const passHash = (uid, pass) => crypto.createHash("sha256").update(uid + "|" + pass).digest("hex");
+
+exports.passLogin = onCall(async (req) => {
+  const mail = String((req.data && req.data.mail) || "").trim();
+  const password = String((req.data && req.data.password) || "");
+  const pickUid = String((req.data && req.data.uid) || "");
+  const low = mail.toLowerCase();
+  if (!low || !password) throw new HttpsError("invalid-argument", "Почта и пароль обязательны.");
+
+  const q = await db.collection("users").where("mailLow", "==", low).get();
+  if (q.empty) throw new HttpsError("not-found", "Аккаунтов с этой почтой нет.");
+
+  const matched = [];
+  for (const d of q.docs) {
+    const sec = await db.collection("secrets").doc(d.id).get();
+    const h = sec.exists ? sec.data().passHash : null;
+    if (h && h === passHash(d.id, password)) matched.push(d);
+  }
+  if (!matched.length) throw new HttpsError("permission-denied", "Неверный пароль (или для аккаунта пароль ещё не установлен — войдите через «Забыли пароль?»).");
+
+  let target = matched[0];
+  if (pickUid) {
+    target = matched.find((d) => d.id === pickUid);
+    if (!target) throw new HttpsError("permission-denied", "Неверный выбор аккаунта.");
+  } else if (matched.length > 1) {
+    return {
+      pick: true,
+      accounts: matched.map((d) => { const u = d.data(); return { uid: d.id, nick: u.nick, name: u.name || "", photo: u.photo || "" }; })
+    };
+  }
+  if (target.data().banned) throw new HttpsError("permission-denied", "Аккаунт заблокирован.");
+  const token = await adminAuth.createCustomToken(target.id);
+  return { token, uid: target.id };
+});
+
+exports.setMyPass = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const password = String((req.data && req.data.password) || "");
+  if (!PASS_RE.test(password)) throw new HttpsError("invalid-argument", "Пароль: минимум 6 символов, латинские буквы и цифры.");
+  await db.collection("secrets").doc(uid).set({ passHash: passHash(uid, password), at: Date.now() }, { merge: true });
+  return { ok: true };
+});
+
+exports.hasPass = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const sec = await db.collection("secrets").doc(uid).get();
+  return { has: !!(sec.exists && sec.data().passHash) };
 });
