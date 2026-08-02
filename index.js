@@ -166,8 +166,7 @@ exports.mailAuthConfirm = onCall(async (req) => {
 
   if (action === "reset") {
     const np = String(d.newPassword || "");
-    if (np.length < 6) throw new HttpsError("invalid-argument", "Пароль короче 6 символов.");
-    await adminAuth.updateUser(uid, { password: np });
+    if (!PASS_RE.test(np)) throw new HttpsError("invalid-argument", "Пароль: минимум 6 символов, латинские буквы и цифры.");
     await db.collection("secrets").doc(uid)
       .set({ passHash: passHash(uid, np), at: Date.now() }, { merge: true });
   } else if (action !== "login") {
@@ -459,6 +458,25 @@ exports.setMyPass = onCall(async (req) => {
   const password = String((req.data && req.data.password) || "");
   if (!PASS_RE.test(password)) throw new HttpsError("invalid-argument", "Пароль: минимум 6 символов, латинские буквы и цифры.");
   await db.collection("secrets").doc(uid).set({ passHash: passHash(uid, password), at: Date.now() }, { merge: true });
+  return { ok: true };
+});
+
+exports.changeMyPass = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const oldPassword = String((req.data && req.data.oldPassword) || "");
+  const newPassword = String((req.data && req.data.newPassword) || "");
+  if (!PASS_RE.test(newPassword)) {
+    throw new HttpsError("invalid-argument", "Новый пароль: минимум 6 символов, латинские буквы и цифры.");
+  }
+  const sec = await db.collection("secrets").doc(uid).get();
+  const cur = sec.exists ? sec.data().passHash : null;
+  if (!cur) throw new HttpsError("failed-precondition", "Пароль ещё не установлен.");
+  if (cur !== passHash(uid, oldPassword)) {
+    throw new HttpsError("permission-denied", "Текущий пароль неверен.");
+  }
+  await db.collection("secrets").doc(uid)
+    .set({ passHash: passHash(uid, newPassword), at: Date.now() }, { merge: true });
   return { ok: true };
 });
 
