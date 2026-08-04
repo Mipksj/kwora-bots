@@ -228,6 +228,177 @@ exports.claimBotBadge = onCall(async (req) => {
   return { ok: true, badgeId: badge.id };
 });
 
+/* ---------- УПРАВЛЕНИЕ БОТАМИ ---------- */
+async function botAccess(uid, botId) {
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  if (!botId) throw new HttpsError("invalid-argument", "Не указан бот.");
+  const b = await db.collection("users").doc(botId).get();
+  if (!b.exists || !b.data().isBot) throw new HttpsError("not-found", "Бот не найден.");
+  const bot = b.data();
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  const ok = bot.botOwner === uid || (bot.botAdmins || []).includes(uid) || isAdmin;
+  if (!ok) throw new HttpsError("permission-denied", "Нет доступа к этому боту.");
+  return { bot, isAdmin };
+}
+
+/* чаты бота — читаем сервером, у пользователя своих прав на них нет */
+exports.botChats = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  await botAccess(uid, botId);
+  const s = await db.collection("chats").where("members", "array-contains", botId).limit(100).get();
+  const rows = [];
+  for (const d of s.docs) {
+    const c = d.data();
+    if (c.type === "group") continue;
+    const peerId = (c.members || []).find((x) => x !== botId);
+    let peer = null;
+    if (peerId) {
+      const p = await db.collection("users").doc(peerId).get();
+      if (p.exists) {
+        const u = p.data();
+        peer = { uid: peerId, nick: u.nick || "", name: u.name || u.nick || "", photo: u.photo || "" };
+      }
+    }
+    rows.push({
+      id: d.id, peer,
+      lastText: c.lastText || "", lastFrom: c.lastFrom || "",
+      lastAt: c.lastAt && c.lastAt.toMillis ? c.lastAt.toMillis() : 0
+    });
+  }
+  rows.sort((a, b) => b.lastAt - a.lastAt);
+  return { chats: rows };
+});
+
+exports.botHistory = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const chatId = String((req.data && req.data.chat) || "");
+  await botAccess(uid, botId);
+  const cs = await db.collection("chats").doc(chatId).get();
+  if (!cs.exists || !(cs.data().members || []).includes(botId)) {
+    throw new HttpsError("permission-denied", "Это не чат бота.");
+  }
+  const s = await db.collection("chats").doc(chatId).collection("messages")
+    .orderBy("at", "desc").limit(60).get();
+  const msgs = s.docs.map((d) => {
+    const m = d.data();
+    return {
+      id: d.id, from: m.from || "", text: m.text || "",
+      img: m.img ? 1 : 0, voice: m.voice ? 1 : 0, video: m.video ? 1 : 0,
+      at: m.at && m.at.toMillis ? m.at.toMillis() : 0
+    };
+  }).reverse();
+  return { msgs };
+});
+
+exports.botSend = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const chatId = String((req.data && req.data.chat) || "");
+  const text = String((req.data && req.data.text) || "").trim().slice(0, 2000);
+  if (!text) throw new HttpsError("invalid-argument", "Пустое сообщение.");
+  await botAccess(uid, botId);
+  const cref = db.collection("chats").doc(chatId);
+  const cs = await cref.get();
+  if (!cs.exists || !(cs.data().members || []).includes(botId)) {
+    throw new HttpsError("permission-denied", "Это не чат бота.");
+  }
+  await cref.collection("messages").add({
+    from: botId, text, at: FieldValue.serverTimestamp(), botReply: true
+  });
+  await cref.set({
+    lastText: text.slice(0, 80), lastFrom: botId, lastAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+  return { ok: true };
+});
+
+/* рассылка всем — только закреплённый бот, не чаще раза в минуту */
+exports.botBroadcast = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const text = String((req.data && req.data.text) || "").trim().slice(0, 2000);
+  if (!text) throw new HttpsError("invalid-argument", "Пустое сообщение.");
+  const { bot, isAdmin } = await botAccess(uid, botId);
+  if (!bot.pinned && !isAdmin) {
+    throw new HttpsError("permission-denied", "Рассылка доступна только закреплённым ботам.");
+  }
+  if (bot.lastCast && Date.now() - bot.lastCast < 60000) {
+    throw new HttpsError("resource-exhausted", "Рассылать можно раз в минуту.");
+  }
+  await db.collection("users").doc(botId).update({ lastCast: Date.now() });
+
+  const us = await db.collection("users").limit(2000).get();
+  const targets = us.docs.filter((d) => {
+    const u = d.data();
+    return !u.isBot && !u.banned && !u.noBroadcast && d.id !== botId;
+  });
+
+  let sent = 0;
+  for (let i = 0; i < targets.length; i += 120) {
+    const chunk = targets.slice(i, i + 120);
+    const batch = db.batch();
+    for (const t of chunk) {
+      const ids = [botId, t.id].sort();
+      const cref = db.collection("chats").doc(ids.join("__"));
+      const u = t.data();
+      batch.set(cref, {
+        type: "dm", members: ids,
+        info: {
+          [botId]: { nick: bot.nick || "", name: bot.name || bot.nick || "" },
+          [t.id]: { nick: u.nick || "", name: u.name || u.nick || "" }
+        },
+        lastText: text.slice(0, 80), lastFrom: botId, lastAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      batch.set(cref.collection("messages").doc(), {
+        from: botId, text, at: FieldValue.serverTimestamp(), botReply: true, cast: true
+      });
+      sent++;
+    }
+    await batch.commit();
+  }
+  return { ok: true, sent };
+});
+
+/* передача доступа: владелец шлёт запрос, человек принимает или отклоняет */
+exports.shareBotAccess = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const nick = String((req.data && req.data.nick) || "").trim().replace(/^@/, "").toLowerCase();
+  const { bot } = await botAccess(uid, botId);
+  if (bot.botOwner !== uid) throw new HttpsError("permission-denied", "Делиться доступом может только владелец.");
+  if (!/^[a-z0-9_]{3,20}$/.test(nick)) throw new HttpsError("invalid-argument", "Ник написан неверно.");
+
+  const s = await db.collection("users").where("nickLow", "==", nick).limit(1).get();
+  if (s.empty) throw new HttpsError("not-found", "Такого ника нет.");
+  const target = s.docs[0];
+  if (target.id === uid) throw new HttpsError("invalid-argument", "Это вы.");
+  if (target.data().isBot) throw new HttpsError("invalid-argument", "Это бот.");
+  if ((bot.botAdmins || []).includes(target.id)) throw new HttpsError("already-exists", "У него уже есть доступ.");
+
+  const meSnap = await db.collection("users").doc(uid).get();
+  await db.collection("users").doc(target.id).collection("botReqs").doc(botId).set({
+    bot: botId, botNick: bot.nick || "", botName: bot.name || bot.nick || "", botPhoto: bot.photo || "",
+    from: uid, fromNick: (meSnap.data() || {}).nick || "", at: FieldValue.serverTimestamp()
+  });
+  return { ok: true };
+});
+
+exports.botAccessDecide = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const botId = String((req.data && req.data.bot) || "");
+  const accept = !!(req.data && req.data.accept);
+  const rref = db.collection("users").doc(uid).collection("botReqs").doc(botId);
+  const r = await rref.get();
+  if (!r.exists) throw new HttpsError("not-found", "Запроса нет.");
+  if (accept) {
+    await db.collection("users").doc(botId).update({ botAdmins: FieldValue.arrayUnion(uid) });
+  }
+  await rref.delete();
+  return { ok: true };
+});
+
 /* ---------- боты (без изменений) ---------- */
 function norm(s) {
   return String(s == null ? "" : s).trim().toLowerCase();
