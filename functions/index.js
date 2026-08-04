@@ -384,6 +384,18 @@ exports.shareBotAccess = onCall(async (req) => {
   return { ok: true };
 });
 
+exports.revokeBotAccess = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const who = String((req.data && req.data.who) || "");
+  const { bot } = await botAccess(uid, botId);
+  if (bot.botOwner !== uid) throw new HttpsError("permission-denied", "Убирать доступ может только владелец.");
+  if (!who) throw new HttpsError("invalid-argument", "Не указан человек.");
+  await db.collection("users").doc(botId).update({ botAdmins: FieldValue.arrayRemove(who) });
+  await db.collection("users").doc(who).collection("botReqs").doc(botId).delete().catch(() => {});
+  return { ok: true };
+});
+
 exports.botAccessDecide = onCall(async (req) => {
   const uid = req.auth && req.auth.uid;
   if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
