@@ -384,6 +384,19 @@ exports.shareBotAccess = onCall(async (req) => {
   return { ok: true };
 });
 
+exports.pinBot = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  if (!isAdmin) throw new HttpsError("permission-denied", "Закреплять может только администратор.");
+  const botId = String((req.data && req.data.bot) || "");
+  const on = !!(req.data && req.data.on);
+  const b = await db.collection("users").doc(botId).get();
+  if (!b.exists || !b.data().isBot) throw new HttpsError("not-found", "Бот не найден.");
+  await db.collection("users").doc(botId).update({ pinned: on });
+  return { ok: true, pinned: on };
+});
+
 exports.revokeBotAccess = onCall(async (req) => {
   const uid = req.auth && req.auth.uid;
   const botId = String((req.data && req.data.bot) || "");
