@@ -25,6 +25,26 @@ const EJS = {
 const sha = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const sixDigits = () => String(Math.floor(100000 + Math.random() * 900000));
 
+/* показываем почту так, чтобы её нельзя было подсмотреть по чужому нику */
+function maskMail(m) {
+  const [a, b] = String(m || "").split("@");
+  if (!b) return "";
+  const head = a.length <= 2 ? a.slice(0, 1) : a.slice(0, 2);
+  return head + "•".repeat(Math.max(2, a.length - head.length)) + "@" + b;
+}
+
+/* вход умеет и почту, и ник: ник разворачиваем в почту на сервере */
+async function resolveMailLow(d) {
+  const mail = String((d && d.mail) || "").trim().toLowerCase();
+  if (mail) return mail;
+  const nick = String((d && d.nick) || "").trim().replace(/^@/, "").toLowerCase();
+  if (!nick) return "";
+  const s = await db.collection("users").where("nickLow", "==", nick).limit(1).get();
+  if (s.empty) return "";
+  const u = s.docs[0].data();
+  return String(u.mailLow || u.mail || "").toLowerCase();
+}
+
 async function sendCodeMail(to, code) {
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST",
@@ -68,8 +88,9 @@ async function accountsOf(mailLow, withAuth) {
 
 /* шаг 1: выслать код на почту */
 exports.mailAuthStart = onCall(async (req) => {
-  const mail = String((req.data && req.data.mail) || "").trim();
-  const mailLow = mail.toLowerCase();
+  const d = req.data || {};
+  const direct = String(d.mail || "").trim();
+  const mailLow = direct ? direct.toLowerCase() : await resolveMailLow(d);
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mailLow)) {
     throw new HttpsError("invalid-argument", "Почта написана неверно.");
   }
@@ -82,16 +103,19 @@ exports.mailAuthStart = onCall(async (req) => {
     hash: sha(code), exp: Date.now() + 10 * 60 * 1000, tries: 0,
     at: FieldValue.serverTimestamp()
   });
-  await sendCodeMail(mail, code);
-  return { ok: true };
+  await sendCodeMail(mailLow, code);
+  return { ok: true, masked: maskMail(mailLow) };
 });
 
 /* шаг 2: проверить код; action = list | login | reset */
 exports.mailAuthConfirm = onCall(async (req) => {
   const d = req.data || {};
-  const mailLow = String(d.mail || "").trim().toLowerCase();
+  const mailLow = String(d.mail || "").trim()
+    ? String(d.mail).trim().toLowerCase()
+    : await resolveMailLow(d);
   const code = String(d.code || "").trim();
   const action = String(d.action || "list");
+  if (!mailLow) throw new HttpsError("invalid-argument", "Не удалось определить почту.");
 
   const ref = db.collection("mailAuth").doc(mailLow);
   const snap = await ref.get();
@@ -415,19 +439,68 @@ exports.changeMyMail = onCall(async (req) => {
 });
 
 
+/* шаг 0: кто это? почта или ник, есть ли аккаунт, стоит ли пароль */
+exports.authLookup = onCall(async (req) => {
+  const raw = String((req.data && req.data.id) || "").trim().replace(/^@/, "");
+  if (!raw) throw new HttpsError("invalid-argument", "Введите почту или ник.");
+  const isMail = raw.includes("@");
+  const low = raw.toLowerCase();
+
+  let snap;
+  if (isMail) {
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(low)) {
+      throw new HttpsError("invalid-argument", "Почта написана неверно.");
+    }
+    snap = await db.collection("users").where("mailLow", "==", low).limit(6).get();
+  } else {
+    if (!/^[a-z0-9_]{3,20}$/.test(low)) {
+      throw new HttpsError("invalid-argument", "Ник: 3–20 знаков, латиница, цифры и _");
+    }
+    snap = await db.collection("users").where("nickLow", "==", low).limit(2).get();
+  }
+
+  const docs = snap.docs.filter((x) => !x.data().isBot);
+  const kind = isMail ? "mail" : "nick";
+  if (!docs.length) return { exists: false, kind, id: raw };
+
+  let hasPass = false;
+  for (const x of docs) {
+    const s = await db.collection("secrets").doc(x.id).get();
+    if (s.exists && s.data().passHash) { hasPass = true; break; }
+  }
+
+  const u = docs[0].data();
+  return {
+    exists: true, kind, id: raw,
+    count: docs.length,
+    hasPass,
+    masked: maskMail(u.mail || ""),
+    account: docs.length === 1
+      ? {
+          nick: u.nick || "", name: u.name || u.nick || "",
+          photo: u.photo || "", verified: !!u.verified, uid: docs[0].id
+        }
+      : null
+  };
+});
+
 /* ---------- ПАРОЛЬНЫЙ ВХОД ---------- */
 const PASS_RE = /^(?=.*[A-Za-z])(?=.*\d)[\x21-\x7E]{6,64}$/;
 const passHash = (uid, pass) => crypto.createHash("sha256").update(uid + "|" + pass).digest("hex");
 
 exports.passLogin = onCall(async (req) => {
-  const mail = String((req.data && req.data.mail) || "").trim();
-  const password = String((req.data && req.data.password) || "");
-  const pickUid = String((req.data && req.data.uid) || "");
-  const low = mail.toLowerCase();
-  if (!low || !password) throw new HttpsError("invalid-argument", "Почта и пароль обязательны.");
+  const d = req.data || {};
+  const password = String(d.password || "");
+  const pickUid = String(d.uid || "");
+  const nick = String(d.nick || "").trim().replace(/^@/, "").toLowerCase();
+  const mailLow = String(d.mail || "").trim().toLowerCase();
+  if (!password) throw new HttpsError("invalid-argument", "Введите пароль.");
+  if (!mailLow && !nick) throw new HttpsError("invalid-argument", "Нужна почта или ник.");
 
-  const q = await db.collection("users").where("mailLow", "==", low).get();
-  if (q.empty) throw new HttpsError("not-found", "Аккаунтов с этой почтой нет.");
+  const q = nick
+    ? await db.collection("users").where("nickLow", "==", nick).limit(2).get()
+    : await db.collection("users").where("mailLow", "==", mailLow).get();
+  if (q.empty) throw new HttpsError("not-found", "Такого аккаунта нет.");
 
   const matched = [];
   for (const d of q.docs) {
@@ -435,7 +508,7 @@ exports.passLogin = onCall(async (req) => {
     const h = sec.exists ? sec.data().passHash : null;
     if (h && h === passHash(d.id, password)) matched.push(d);
   }
-  if (!matched.length) throw new HttpsError("permission-denied", "Неверный пароль (или для аккаунта пароль ещё не установлен — войдите через «Забыли пароль?»).");
+  if (!matched.length) throw new HttpsError("permission-denied", "Неверный пароль.");
 
   let target = matched[0];
   if (pickUid) {
