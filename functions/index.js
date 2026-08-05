@@ -397,6 +397,72 @@ exports.pinBot = onCall(async (req) => {
   return { ok: true, pinned: on };
 });
 
+/* ==================== ВХОД ПО QR (веб-версия) ====================
+   Ноутбук просит код -> показывает QR. Телефон сканирует, спрашивает
+   хозяина и подтверждает. Ноутбук забирает токен ровно один раз.       */
+
+const WEB_TTL = 3 * 60 * 1000;                     // код живёт 3 минуты
+const webCode = () => {
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // без похожих символов
+  let s = "";
+  for (let i = 0; i < 8; i++) s += abc[crypto.randomInt(abc.length)];
+  return s;
+};
+
+/* ноутбук: создать код */
+exports.webStart = onCall(async (req) => {
+  const code = webCode();
+  await db.collection("webLogins").doc(code).set({
+    status: "wait",
+    device: String((req.data && req.data.device) || "Неизвестное устройство").slice(0, 80),
+    at: Date.now()
+  });
+  return { code };
+});
+
+/* телефон: чей это код и что за устройство */
+exports.webLookup = onCall(async (req) => {
+  if (!(req.auth && req.auth.uid)) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const d = await db.collection("webLogins").doc(code).get();
+  if (!d.exists) throw new HttpsError("not-found", "Код не найден. Обнови страницу на компьютере.");
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL) throw new HttpsError("deadline-exceeded", "Код устарел. Обнови страницу на компьютере.");
+  if (v.status !== "wait") throw new HttpsError("failed-precondition", "Этот код уже использован.");
+  return { device: v.device };
+});
+
+/* телефон: принять или отклонить */
+exports.webApprove = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const accept = !!(req.data && req.data.accept);
+  const ref = db.collection("webLogins").doc(code);
+  const d = await ref.get();
+  if (!d.exists) throw new HttpsError("not-found", "Код не найден.");
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL) throw new HttpsError("deadline-exceeded", "Код устарел.");
+  if (v.status !== "wait") throw new HttpsError("failed-precondition", "Этот код уже использован.");
+  if (!accept) { await ref.set({ status: "no" }, { merge: true }); return { ok: true }; }
+  const token = await adminAuth.createCustomToken(uid);
+  await ref.set({ status: "ok", uid, token }, { merge: true });
+  return { ok: true };
+});
+
+/* ноутбук: опрос. Токен отдаём один раз и сразу стираем */
+exports.webPoll = onCall(async (req) => {
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const ref = db.collection("webLogins").doc(code);
+  const d = await ref.get();
+  if (!d.exists) return { status: "gone" };
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL && v.status === "wait") return { status: "gone" };
+  if (v.status === "no") { await ref.delete(); return { status: "no" }; }
+  if (v.status === "ok") { await ref.delete(); return { status: "ok", token: v.token }; }
+  return { status: "wait" };
+});
+
 exports.revokeBotAccess = onCall(async (req) => {
   const uid = req.auth && req.auth.uid;
   const botId = String((req.data && req.data.bot) || "");
