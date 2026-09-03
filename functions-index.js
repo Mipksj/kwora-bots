@@ -1,6 +1,7 @@
 /**
  * Kwora server: боты + почтовая авторизация (забыл пароль / вход без пароля).
  */
+const crypto = require("crypto");
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
@@ -165,8 +166,9 @@ exports.mailAuthConfirm = onCall(async (req) => {
 
   if (action === "reset") {
     const np = String(d.newPassword || "");
-    if (np.length < 6) throw new HttpsError("invalid-argument", "Пароль короче 6 символов.");
-    await adminAuth.updateUser(uid, { password: np });
+    if (!PASS_RE.test(np)) throw new HttpsError("invalid-argument", "Пароль: минимум 6 символов, латинские буквы и цифры.");
+    await db.collection("secrets").doc(uid)
+      .set({ passHash: passHash(uid, np), at: Date.now() }, { merge: true });
   } else if (action !== "login") {
     throw new HttpsError("invalid-argument", "Неизвестное действие.");
   }
@@ -286,7 +288,7 @@ exports.onBotMessage = onDocumentCreated(
 
 
 /* ---------- ПУШ-УВЕДОМЛЕНИЯ о новых сообщениях ---------- */
-const APP_URL = "https://mipksj.github.io/kwora/";
+const APP_URL = "https://kwora.ru/";
 
 exports.pushOnMessage = onDocumentCreated("chats/{chat}/messages/{msg}", async (event) => {
   const m = event.data ? event.data.data() : null;
@@ -459,9 +461,114 @@ exports.setMyPass = onCall(async (req) => {
   return { ok: true };
 });
 
+exports.changeMyPass = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const oldPassword = String((req.data && req.data.oldPassword) || "");
+  const newPassword = String((req.data && req.data.newPassword) || "");
+  if (!PASS_RE.test(newPassword)) {
+    throw new HttpsError("invalid-argument", "Новый пароль: минимум 6 символов, латинские буквы и цифры.");
+  }
+  const sec = await db.collection("secrets").doc(uid).get();
+  const cur = sec.exists ? sec.data().passHash : null;
+  if (!cur) throw new HttpsError("failed-precondition", "Пароль ещё не установлен.");
+  if (cur !== passHash(uid, oldPassword)) {
+    throw new HttpsError("permission-denied", "Текущий пароль неверен.");
+  }
+  await db.collection("secrets").doc(uid)
+    .set({ passHash: passHash(uid, newPassword), at: Date.now() }, { merge: true });
+  return { ok: true };
+});
+
 exports.hasPass = onCall(async (req) => {
   const uid = req.auth && req.auth.uid;
   if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
   const sec = await db.collection("secrets").doc(uid).get();
   return { has: !!(sec.exists && sec.data().passHash) };
+});
+
+/* ============ РАЗДАЧА ЗНАЧКОВ ПО ПРИВАТНЫМ ССЫЛКАМ ============ */
+const BADGE_CODE_LEN = 16;
+const genCode = () => crypto.randomBytes(BADGE_CODE_LEN/2).toString('hex');
+
+exports.createBadgeLink = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  
+  const { badgeId, uses } = req.data;
+  if (!badgeId || typeof badgeId !== "string") throw new HttpsError("invalid-argument", "badgeId требуется.");
+  if (!uses || uses < 1 || uses > 1000) throw new HttpsError("invalid-argument", "uses: 1-1000.");
+
+  /* проверяем, админ ли */
+  const isAdmin = !!(await db.collection("admins").doc(uid).get()).exists;
+  if (!isAdmin) throw new HttpsError("permission-denied", "Только админы.");
+
+  /* проверяем, существует ли такой значок */
+  const badge = await db.collection("badges").doc(badgeId).get();
+  if (!badge.exists) throw new HttpsError("not-found", "Значок не найден.");
+
+  const code = genCode();
+  await db.collection("badge-links").doc(code).set({
+    badge: badgeId,
+    uses: uses,
+    createdBy: uid,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    claimed: []
+  });
+
+  return { code, url: `https://kwora.ru/get/${code}` };
+});
+
+exports.claimBadgeByLink = onCall(async (req) => {
+  const { code, mail, uid } = req.data;
+  if (!code || typeof code !== "string") throw new HttpsError("invalid-argument", "code требуется.");
+
+  /* найти ссылку */
+  const linkSnap = await db.collection("badge-links").doc(code).get();
+  if (!linkSnap.exists) throw new HttpsError("not-found", "Ссылка не найдена или истекла.");
+  const link = linkSnap.data();
+  
+  if (link.uses <= 0) throw new HttpsError("resource-exhausted", "Ссылка использована полностью.");
+  if (link.claimed && link.claimed.includes(uid)) {
+    throw new HttpsError("already-exists", "Вы уже получили значок по этой ссылке.");
+  }
+
+  /* если uid передан (после выбора аккаунта) */
+  if (uid) {
+    const user = await db.collection("users").doc(uid).get();
+    if (!user.exists) throw new HttpsError("not-found", "Аккаунт не найден.");
+    
+    /* выдать значок */
+    const badges = user.data().badges || [];
+    if (!badges.includes(link.badge)) badges.push(link.badge);
+    
+    await db.collection("users").doc(uid).update({ badges });
+    
+    /* вычесть use и добавить uid в claimed */
+    await db.collection("badge-links").doc(code).update({
+      uses: link.uses - 1,
+      claimed: admin.firestore.FieldValue.arrayUnion(uid)
+    });
+
+    return { success: true };
+  }
+
+  /* если uid не передан - ищем аккаунты по mail */
+  if (!mail || typeof mail !== "string") throw new HttpsError("invalid-argument", "mail требуется.");
+  const mailLow = mail.toLowerCase().trim();
+  
+  const users = await db.collection("users")
+    .where("mailLow", "==", mailLow)
+    .limit(10)
+    .get();
+  
+  if (users.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой не найдено.");
+  
+  const accounts = users.docs.map(d => ({
+    uid: d.id,
+    nick: d.data().nick,
+    name: d.data().name
+  }));
+
+  return { accounts };
 });
