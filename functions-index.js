@@ -25,6 +25,26 @@ const EJS = {
 const sha = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const sixDigits = () => String(Math.floor(100000 + Math.random() * 900000));
 
+/* показываем почту так, чтобы её нельзя было подсмотреть по чужому нику */
+function maskMail(m) {
+  const [a, b] = String(m || "").split("@");
+  if (!b) return "";
+  const head = a.length <= 2 ? a.slice(0, 1) : a.slice(0, 2);
+  return head + "•".repeat(Math.max(2, a.length - head.length)) + "@" + b;
+}
+
+/* вход умеет и почту, и ник: ник разворачиваем в почту на сервере */
+async function resolveMailLow(d) {
+  const mail = String((d && d.mail) || "").trim().toLowerCase();
+  if (mail) return mail;
+  const nick = String((d && d.nick) || "").trim().replace(/^@/, "").toLowerCase();
+  if (!nick) return "";
+  const s = await db.collection("users").where("nickLow", "==", nick).limit(1).get();
+  if (s.empty) return "";
+  const u = s.docs[0].data();
+  return String(u.mailLow || u.mail || "").toLowerCase();
+}
+
 async function sendCodeMail(to, code) {
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST",
@@ -68,8 +88,9 @@ async function accountsOf(mailLow, withAuth) {
 
 /* шаг 1: выслать код на почту */
 exports.mailAuthStart = onCall(async (req) => {
-  const mail = String((req.data && req.data.mail) || "").trim();
-  const mailLow = mail.toLowerCase();
+  const d = req.data || {};
+  const direct = String(d.mail || "").trim();
+  const mailLow = direct ? direct.toLowerCase() : await resolveMailLow(d);
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mailLow)) {
     throw new HttpsError("invalid-argument", "Почта написана неверно.");
   }
@@ -82,16 +103,19 @@ exports.mailAuthStart = onCall(async (req) => {
     hash: sha(code), exp: Date.now() + 10 * 60 * 1000, tries: 0,
     at: FieldValue.serverTimestamp()
   });
-  await sendCodeMail(mail, code);
-  return { ok: true };
+  await sendCodeMail(mailLow, code);
+  return { ok: true, masked: maskMail(mailLow) };
 });
 
 /* шаг 2: проверить код; action = list | login | reset */
 exports.mailAuthConfirm = onCall(async (req) => {
   const d = req.data || {};
-  const mailLow = String(d.mail || "").trim().toLowerCase();
+  const mailLow = String(d.mail || "").trim()
+    ? String(d.mail).trim().toLowerCase()
+    : await resolveMailLow(d);
   const code = String(d.code || "").trim();
   const action = String(d.action || "list");
+  if (!mailLow) throw new HttpsError("invalid-argument", "Не удалось определить почту.");
 
   const ref = db.collection("mailAuth").doc(mailLow);
   const snap = await ref.get();
@@ -202,6 +226,268 @@ exports.claimBotBadge = onCall(async (req) => {
     badges: FieldValue.arrayUnion(badge.id)
   });
   return { ok: true, badgeId: badge.id };
+});
+
+/* ---------- УПРАВЛЕНИЕ БОТАМИ ---------- */
+async function botAccess(uid, botId) {
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  if (!botId) throw new HttpsError("invalid-argument", "Не указан бот.");
+  const b = await db.collection("users").doc(botId).get();
+  if (!b.exists || !b.data().isBot) throw new HttpsError("not-found", "Бот не найден.");
+  const bot = b.data();
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  const ok = bot.botOwner === uid || (bot.botAdmins || []).includes(uid) || isAdmin;
+  if (!ok) throw new HttpsError("permission-denied", "Нет доступа к этому боту.");
+  return { bot, isAdmin };
+}
+
+/* чаты бота — читаем сервером, у пользователя своих прав на них нет */
+exports.botChats = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  await botAccess(uid, botId);
+  const s = await db.collection("chats").where("members", "array-contains", botId).limit(100).get();
+  const rows = [];
+  for (const d of s.docs) {
+    const c = d.data();
+    if (c.type === "group") continue;
+    const peerId = (c.members || []).find((x) => x !== botId);
+    let peer = null;
+    if (peerId) {
+      const p = await db.collection("users").doc(peerId).get();
+      if (p.exists) {
+        const u = p.data();
+        peer = { uid: peerId, nick: u.nick || "", name: u.name || u.nick || "", photo: u.photo || "" };
+      }
+    }
+    rows.push({
+      id: d.id, peer,
+      lastText: c.lastText || "", lastFrom: c.lastFrom || "",
+      lastAt: c.lastAt && c.lastAt.toMillis ? c.lastAt.toMillis() : 0
+    });
+  }
+  rows.sort((a, b) => b.lastAt - a.lastAt);
+  return { chats: rows };
+});
+
+exports.botHistory = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const chatId = String((req.data && req.data.chat) || "");
+  await botAccess(uid, botId);
+  const cs = await db.collection("chats").doc(chatId).get();
+  if (!cs.exists || !(cs.data().members || []).includes(botId)) {
+    throw new HttpsError("permission-denied", "Это не чат бота.");
+  }
+  const s = await db.collection("chats").doc(chatId).collection("messages")
+    .orderBy("at", "desc").limit(60).get();
+  const msgs = s.docs.map((d) => {
+    const m = d.data();
+    return {
+      id: d.id, from: m.from || "", text: m.text || "",
+      img: m.img ? 1 : 0, voice: m.voice ? 1 : 0, video: m.video ? 1 : 0,
+      at: m.at && m.at.toMillis ? m.at.toMillis() : 0
+    };
+  }).reverse();
+  return { msgs };
+});
+
+exports.botSend = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const chatId = String((req.data && req.data.chat) || "");
+  const text = String((req.data && req.data.text) || "").trim().slice(0, 2000);
+  if (!text) throw new HttpsError("invalid-argument", "Пустое сообщение.");
+  await botAccess(uid, botId);
+  const cref = db.collection("chats").doc(chatId);
+  const cs = await cref.get();
+  if (!cs.exists || !(cs.data().members || []).includes(botId)) {
+    throw new HttpsError("permission-denied", "Это не чат бота.");
+  }
+  await cref.collection("messages").add({
+    from: botId, text, at: FieldValue.serverTimestamp(), botReply: true
+  });
+  await cref.set({
+    lastText: text.slice(0, 80), lastFrom: botId, lastAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+  return { ok: true };
+});
+
+/* рассылка всем — только закреплённый бот, не чаще раза в минуту */
+exports.botBroadcast = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const text = String((req.data && req.data.text) || "").trim().slice(0, 2000);
+  if (!text) throw new HttpsError("invalid-argument", "Пустое сообщение.");
+  const { bot, isAdmin } = await botAccess(uid, botId);
+  if (!bot.pinned && !isAdmin) {
+    throw new HttpsError("permission-denied", "Рассылка доступна только закреплённым ботам.");
+  }
+  if (bot.lastCast && Date.now() - bot.lastCast < 60000) {
+    throw new HttpsError("resource-exhausted", "Рассылать можно раз в минуту.");
+  }
+  await db.collection("users").doc(botId).update({ lastCast: Date.now() });
+
+  const us = await db.collection("users").limit(2000).get();
+  const targets = us.docs.filter((d) => {
+    const u = d.data();
+    return !u.isBot && !u.banned && !u.noBroadcast && d.id !== botId;
+  });
+
+  let sent = 0;
+  for (let i = 0; i < targets.length; i += 120) {
+    const chunk = targets.slice(i, i + 120);
+    const batch = db.batch();
+    for (const t of chunk) {
+      const ids = [botId, t.id].sort();
+      const cref = db.collection("chats").doc(ids.join("__"));
+      const u = t.data();
+      batch.set(cref, {
+        type: "dm", members: ids,
+        info: {
+          [botId]: { nick: bot.nick || "", name: bot.name || bot.nick || "" },
+          [t.id]: { nick: u.nick || "", name: u.name || u.nick || "" }
+        },
+        lastText: text.slice(0, 80), lastFrom: botId, lastAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+      batch.set(cref.collection("messages").doc(), {
+        from: botId, text, at: FieldValue.serverTimestamp(), botReply: true, cast: true
+      });
+      sent++;
+    }
+    await batch.commit();
+  }
+  return { ok: true, sent };
+});
+
+/* передача доступа: владелец шлёт запрос, человек принимает или отклоняет */
+exports.shareBotAccess = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const nick = String((req.data && req.data.nick) || "").trim().replace(/^@/, "").toLowerCase();
+  const { bot } = await botAccess(uid, botId);
+  if (bot.botOwner !== uid) throw new HttpsError("permission-denied", "Делиться доступом может только владелец.");
+  if (!/^[a-z0-9_]{3,20}$/.test(nick)) throw new HttpsError("invalid-argument", "Ник написан неверно.");
+
+  const s = await db.collection("users").where("nickLow", "==", nick).limit(1).get();
+  if (s.empty) throw new HttpsError("not-found", "Такого ника нет.");
+  const target = s.docs[0];
+  if (target.id === uid) throw new HttpsError("invalid-argument", "Это вы.");
+  if (target.data().isBot) throw new HttpsError("invalid-argument", "Это бот.");
+  if ((bot.botAdmins || []).includes(target.id)) throw new HttpsError("already-exists", "У него уже есть доступ.");
+
+  const meSnap = await db.collection("users").doc(uid).get();
+  await db.collection("users").doc(target.id).collection("botReqs").doc(botId).set({
+    bot: botId, botNick: bot.nick || "", botName: bot.name || bot.nick || "", botPhoto: bot.photo || "",
+    from: uid, fromNick: (meSnap.data() || {}).nick || "", at: FieldValue.serverTimestamp()
+  });
+  return { ok: true };
+});
+
+exports.pinBot = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  if (!isAdmin) throw new HttpsError("permission-denied", "Закреплять может только администратор.");
+  const botId = String((req.data && req.data.bot) || "");
+  const on = !!(req.data && req.data.on);
+  const b = await db.collection("users").doc(botId).get();
+  if (!b.exists || !b.data().isBot) throw new HttpsError("not-found", "Бот не найден.");
+  await db.collection("users").doc(botId).update({ pinned: on });
+  return { ok: true, pinned: on };
+});
+
+/* ==================== ВХОД ПО QR (веб-версия) ====================
+   Ноутбук просит код -> показывает QR. Телефон сканирует, спрашивает
+   хозяина и подтверждает. Ноутбук забирает токен ровно один раз.       */
+
+const WEB_TTL = 3 * 60 * 1000;                     // код живёт 3 минуты
+const webCode = () => {
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // без похожих символов
+  let s = "";
+  for (let i = 0; i < 8; i++) s += abc[crypto.randomInt(abc.length)];
+  return s;
+};
+
+/* ноутбук: создать код */
+exports.webStart = onCall(async (req) => {
+  const code = webCode();
+  await db.collection("webLogins").doc(code).set({
+    status: "wait",
+    device: String((req.data && req.data.device) || "Неизвестное устройство").slice(0, 80),
+    at: Date.now()
+  });
+  return { code };
+});
+
+/* телефон: чей это код и что за устройство */
+exports.webLookup = onCall(async (req) => {
+  if (!(req.auth && req.auth.uid)) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const d = await db.collection("webLogins").doc(code).get();
+  if (!d.exists) throw new HttpsError("not-found", "Код не найден. Обнови страницу на компьютере.");
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL) throw new HttpsError("deadline-exceeded", "Код устарел. Обнови страницу на компьютере.");
+  if (v.status !== "wait") throw new HttpsError("failed-precondition", "Этот код уже использован.");
+  return { device: v.device };
+});
+
+/* телефон: принять или отклонить */
+exports.webApprove = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const accept = !!(req.data && req.data.accept);
+  const ref = db.collection("webLogins").doc(code);
+  const d = await ref.get();
+  if (!d.exists) throw new HttpsError("not-found", "Код не найден.");
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL) throw new HttpsError("deadline-exceeded", "Код устарел.");
+  if (v.status !== "wait") throw new HttpsError("failed-precondition", "Этот код уже использован.");
+  if (!accept) { await ref.set({ status: "no" }, { merge: true }); return { ok: true }; }
+  const token = await adminAuth.createCustomToken(uid);
+  await ref.set({ status: "ok", uid, token }, { merge: true });
+  return { ok: true };
+});
+
+/* ноутбук: опрос. Токен отдаём один раз и сразу стираем */
+exports.webPoll = onCall(async (req) => {
+  const code = String((req.data && req.data.code) || "").toUpperCase().trim();
+  const ref = db.collection("webLogins").doc(code);
+  const d = await ref.get();
+  if (!d.exists) return { status: "gone" };
+  const v = d.data();
+  if (Date.now() - v.at > WEB_TTL && v.status === "wait") return { status: "gone" };
+  if (v.status === "no") { await ref.delete(); return { status: "no" }; }
+  if (v.status === "ok") { await ref.delete(); return { status: "ok", token: v.token }; }
+  return { status: "wait" };
+});
+
+exports.revokeBotAccess = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  const botId = String((req.data && req.data.bot) || "");
+  const who = String((req.data && req.data.who) || "");
+  const { bot } = await botAccess(uid, botId);
+  if (bot.botOwner !== uid) throw new HttpsError("permission-denied", "Убирать доступ может только владелец.");
+  if (!who) throw new HttpsError("invalid-argument", "Не указан человек.");
+  await db.collection("users").doc(botId).update({ botAdmins: FieldValue.arrayRemove(who) });
+  await db.collection("users").doc(who).collection("botReqs").doc(botId).delete().catch(() => {});
+  return { ok: true };
+});
+
+exports.botAccessDecide = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const botId = String((req.data && req.data.bot) || "");
+  const accept = !!(req.data && req.data.accept);
+  const rref = db.collection("users").doc(uid).collection("botReqs").doc(botId);
+  const r = await rref.get();
+  if (!r.exists) throw new HttpsError("not-found", "Запроса нет.");
+  if (accept) {
+    await db.collection("users").doc(botId).update({ botAdmins: FieldValue.arrayUnion(uid) });
+  }
+  await rref.delete();
+  return { ok: true };
 });
 
 /* ---------- боты (без изменений) ---------- */
@@ -415,19 +701,68 @@ exports.changeMyMail = onCall(async (req) => {
 });
 
 
+/* шаг 0: кто это? почта или ник, есть ли аккаунт, стоит ли пароль */
+exports.authLookup = onCall(async (req) => {
+  const raw = String((req.data && req.data.id) || "").trim().replace(/^@/, "");
+  if (!raw) throw new HttpsError("invalid-argument", "Введите почту или ник.");
+  const isMail = raw.includes("@");
+  const low = raw.toLowerCase();
+
+  let snap;
+  if (isMail) {
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(low)) {
+      throw new HttpsError("invalid-argument", "Почта написана неверно.");
+    }
+    snap = await db.collection("users").where("mailLow", "==", low).limit(6).get();
+  } else {
+    if (!/^[a-z0-9_]{3,20}$/.test(low)) {
+      throw new HttpsError("invalid-argument", "Ник: 3–20 знаков, латиница, цифры и _");
+    }
+    snap = await db.collection("users").where("nickLow", "==", low).limit(2).get();
+  }
+
+  const docs = snap.docs.filter((x) => !x.data().isBot);
+  const kind = isMail ? "mail" : "nick";
+  if (!docs.length) return { exists: false, kind, id: raw };
+
+  let hasPass = false;
+  for (const x of docs) {
+    const s = await db.collection("secrets").doc(x.id).get();
+    if (s.exists && s.data().passHash) { hasPass = true; break; }
+  }
+
+  const u = docs[0].data();
+  return {
+    exists: true, kind, id: raw,
+    count: docs.length,
+    hasPass,
+    masked: maskMail(u.mail || ""),
+    account: docs.length === 1
+      ? {
+          nick: u.nick || "", name: u.name || u.nick || "",
+          photo: u.photo || "", verified: !!u.verified, uid: docs[0].id
+        }
+      : null
+  };
+});
+
 /* ---------- ПАРОЛЬНЫЙ ВХОД ---------- */
 const PASS_RE = /^(?=.*[A-Za-z])(?=.*\d)[\x21-\x7E]{6,64}$/;
 const passHash = (uid, pass) => crypto.createHash("sha256").update(uid + "|" + pass).digest("hex");
 
 exports.passLogin = onCall(async (req) => {
-  const mail = String((req.data && req.data.mail) || "").trim();
-  const password = String((req.data && req.data.password) || "");
-  const pickUid = String((req.data && req.data.uid) || "");
-  const low = mail.toLowerCase();
-  if (!low || !password) throw new HttpsError("invalid-argument", "Почта и пароль обязательны.");
+  const d = req.data || {};
+  const password = String(d.password || "");
+  const pickUid = String(d.uid || "");
+  const nick = String(d.nick || "").trim().replace(/^@/, "").toLowerCase();
+  const mailLow = String(d.mail || "").trim().toLowerCase();
+  if (!password) throw new HttpsError("invalid-argument", "Введите пароль.");
+  if (!mailLow && !nick) throw new HttpsError("invalid-argument", "Нужна почта или ник.");
 
-  const q = await db.collection("users").where("mailLow", "==", low).get();
-  if (q.empty) throw new HttpsError("not-found", "Аккаунтов с этой почтой нет.");
+  const q = nick
+    ? await db.collection("users").where("nickLow", "==", nick).limit(2).get()
+    : await db.collection("users").where("mailLow", "==", mailLow).get();
+  if (q.empty) throw new HttpsError("not-found", "Такого аккаунта нет.");
 
   const matched = [];
   for (const d of q.docs) {
@@ -435,7 +770,7 @@ exports.passLogin = onCall(async (req) => {
     const h = sec.exists ? sec.data().passHash : null;
     if (h && h === passHash(d.id, password)) matched.push(d);
   }
-  if (!matched.length) throw new HttpsError("permission-denied", "Неверный пароль (или для аккаунта пароль ещё не установлен — войдите через «Забыли пароль?»).");
+  if (!matched.length) throw new HttpsError("permission-denied", "Неверный пароль.");
 
   let target = matched[0];
   if (pickUid) {
@@ -488,7 +823,7 @@ exports.hasPass = onCall(async (req) => {
 });
 
 /* ============ РАЗДАЧА ЗНАЧКОВ ПО ПРИВАТНЫМ ССЫЛКАМ ============ */
-const genCode = () => crypto.randomBytes(8).toString("hex");
+const genBadgeCode = () => crypto.randomBytes(8).toString("hex");
 
 exports.createBadgeLink = onCall(async (req) => {
   const uid = req.auth && req.auth.uid;
@@ -507,7 +842,7 @@ exports.createBadgeLink = onCall(async (req) => {
   const badge = await db.collection("badges").doc(badgeId).get();
   if (!badge.exists) throw new HttpsError("not-found", "Значок не найден.");
 
-  const code = genCode();
+  const code = genBadgeCode();
   await db.collection("badgeLinks").doc(code).set({
     badge: badgeId,
     left: uses,
@@ -520,41 +855,7 @@ exports.createBadgeLink = onCall(async (req) => {
   return { code, url: "https://kwora.ru/get/?code=" + code };
 });
 
-exports.claimBadgeByLink = onCall(async (req) => {
-  const code = String((req.data && req.data.code) || "").trim();
-  const mail = String((req.data && req.data.mail) || "").trim().toLowerCase();
-  const pick = String((req.data && req.data.uid) || "").trim();
-
-  if (!code) throw new HttpsError("invalid-argument", "Нет кода ссылки.");
-  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
-
-  const ref = db.collection("badgeLinks").doc(code);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Ссылка не найдена.");
-  const link = snap.data();
-  if ((link.left || 0) <= 0) throw new HttpsError("resource-exhausted", "Ссылка больше не действует.");
-
-  /* аккаунты на этой почте */
-  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
-  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
-
-  /* шаг 1: почта введена, аккаунт ещё не выбран */
-  if (!pick) {
-    if (found.size > 1) {
-      return { accounts: found.docs.map(d => ({
-        uid: d.id, nick: d.data().nick || "", name: d.data().name || ""
-      })) };
-    }
-    return await giveBadge(ref, link, found.docs[0]);
-  }
-
-  /* шаг 2: аккаунт выбран — он обязан принадлежать этой же почте */
-  const target = found.docs.find(d => d.id === pick);
-  if (!target) throw new HttpsError("permission-denied", "Этот аккаунт не связан с указанной почтой.");
-  return await giveBadge(ref, link, target);
-});
-
-async function giveBadge(ref, link, userDoc){
+async function giveBadgeTo(ref, link, userDoc){
   if ((link.claimed || []).includes(userDoc.id)) {
     throw new HttpsError("already-exists", "Этот аккаунт уже получил значок по ссылке.");
   }
@@ -570,3 +871,35 @@ async function giveBadge(ref, link, userDoc){
   });
   return { success: true, badge: link.badge };
 }
+
+exports.claimBadgeByLink = onCall(async (req) => {
+  const code = String((req.data && req.data.code) || "").trim();
+  const mail = String((req.data && req.data.mail) || "").trim().toLowerCase();
+  const pick = String((req.data && req.data.uid) || "").trim();
+
+  if (!code) throw new HttpsError("invalid-argument", "Нет кода ссылки.");
+  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
+
+  const ref = db.collection("badgeLinks").doc(code);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Ссылка не найдена.");
+  const link = snap.data();
+  if ((link.left || 0) <= 0) throw new HttpsError("resource-exhausted", "Ссылка больше не действует.");
+
+  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
+  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
+
+  if (!pick) {
+    if (found.size > 1) {
+      return { accounts: found.docs.map(d => ({
+        uid: d.id, nick: d.data().nick || "", name: d.data().name || ""
+      })) };
+    }
+    return await giveBadgeTo(ref, link, found.docs[0]);
+  }
+
+  const target = found.docs.find(d => d.id === pick);
+  if (!target) throw new HttpsError("permission-denied", "Этот аккаунт не связан с указанной почтой.");
+  return await giveBadgeTo(ref, link, target);
+});
+
