@@ -942,6 +942,18 @@ exports.createBonusCodes = onCall(async (req) => {
   return { codes: out };
 });
 
+async function creditBonus(ref, uid){
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Такого кода нет.");
+    const d = snap.data();
+    if (d.claimedBy) throw new HttpsError("resource-exhausted", "Код уже использован.");
+    t.update(ref, { claimedBy: uid, claimedAt: FieldValue.serverTimestamp() });
+    t.update(db.collection("users").doc(uid), { points: FieldValue.increment(d.points) });
+    return d.points;
+  });
+}
+
 exports.claimBonusCode = onCall(async (req) => {
   const raw = String((req.data && req.data.code) || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const code = raw.length === 8 ? raw.slice(0, 4) + "-" + raw.slice(4) : "";
@@ -949,15 +961,26 @@ exports.claimBonusCode = onCall(async (req) => {
   const pick = String((req.data && req.data.uid) || "").trim();
 
   if (!code) throw new HttpsError("invalid-argument", "Код выглядит неверно — в нём 8 символов.");
-  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
-
-  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
-  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
 
   const ref = db.collection("bonusCodes").doc(code);
   const pre = await ref.get();
   if (!pre.exists) throw new HttpsError("not-found", "Такого кода нет.");
   if (pre.data().claimedBy) throw new HttpsError("resource-exhausted", "Код уже использован.");
+
+  /* вызов из приложения: человек уже вошёл, почта не нужна */
+  const authUid = req.auth && req.auth.uid;
+  if (authUid && !mail) {
+    const us = await db.collection("users").doc(authUid).get();
+    if (!us.exists) throw new HttpsError("not-found", "Аккаунт не найден.");
+    const pts = await creditBonus(ref, authUid);
+    return { success: true, points: pts };
+  }
+
+  /* вызов со страницы kwora.ru/bonus/ — по почте */
+  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
+
+  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
+  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
 
   if (!pick && found.size > 1) {
     return { accounts: found.docs.map(d => ({
@@ -967,16 +990,7 @@ exports.claimBonusCode = onCall(async (req) => {
   const target = pick ? found.docs.find(d => d.id === pick) : found.docs[0];
   if (!target) throw new HttpsError("permission-denied", "Этот аккаунт не связан с указанной почтой.");
 
-  const pts = await db.runTransaction(async (t) => {
-    const snap = await t.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Такого кода нет.");
-    const d = snap.data();
-    if (d.claimedBy) throw new HttpsError("resource-exhausted", "Код уже использован.");
-    t.update(ref, { claimedBy: target.id, claimedAt: FieldValue.serverTimestamp() });
-    t.update(db.collection("users").doc(target.id), { points: FieldValue.increment(d.points) });
-    return d.points;
-  });
-
+  const pts = await creditBonus(ref, target.id);
   return { success: true, points: pts };
 });
 
