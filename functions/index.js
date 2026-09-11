@@ -821,3 +821,209 @@ exports.hasPass = onCall(async (req) => {
   const sec = await db.collection("secrets").doc(uid).get();
   return { has: !!(sec.exists && sec.data().passHash) };
 });
+
+/* ============ РАЗДАЧА ЗНАЧКОВ ПО ПРИВАТНЫМ ССЫЛКАМ ============ */
+const genBadgeCode = () => crypto.randomBytes(8).toString("hex");
+
+exports.createBadgeLink = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+
+  const badgeId = String((req.data && req.data.badgeId) || "").trim();
+  const uses = Number((req.data && req.data.uses) || 0);
+  if (!badgeId) throw new HttpsError("invalid-argument", "Не выбран значок.");
+  if (!Number.isInteger(uses) || uses < 1 || uses > 1000) {
+    throw new HttpsError("invalid-argument", "Количество использований: от 1 до 1000.");
+  }
+
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  if (!isAdmin) throw new HttpsError("permission-denied", "Только для админов.");
+
+  const badge = await db.collection("badges").doc(badgeId).get();
+  if (!badge.exists) throw new HttpsError("not-found", "Значок не найден.");
+
+  const code = genBadgeCode();
+  await db.collection("badgeLinks").doc(code).set({
+    badge: badgeId,
+    left: uses,
+    total: uses,
+    createdBy: uid,
+    createdAt: FieldValue.serverTimestamp(),
+    claimed: []
+  });
+
+  return { code, url: "https://kwora.ru/get/?code=" + code };
+});
+
+async function giveBadgeTo(ref, link, userDoc){
+  if ((link.claimed || []).includes(userDoc.id)) {
+    throw new HttpsError("already-exists", "Этот аккаунт уже получил значок по ссылке.");
+  }
+  const badges = userDoc.data().badges || [];
+  if (!badges.includes(link.badge)) {
+    await db.collection("users").doc(userDoc.id).update({
+      badges: FieldValue.arrayUnion(link.badge)
+    });
+  }
+  await ref.update({
+    left: FieldValue.increment(-1),
+    claimed: FieldValue.arrayUnion(userDoc.id)
+  });
+  return { success: true, badge: link.badge };
+}
+
+exports.claimBadgeByLink = onCall(async (req) => {
+  const code = String((req.data && req.data.code) || "").trim();
+  const mail = String((req.data && req.data.mail) || "").trim().toLowerCase();
+  const pick = String((req.data && req.data.uid) || "").trim();
+
+  if (!code) throw new HttpsError("invalid-argument", "Нет кода ссылки.");
+  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
+
+  const ref = db.collection("badgeLinks").doc(code);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Ссылка не найдена.");
+  const link = snap.data();
+  if ((link.left || 0) <= 0) throw new HttpsError("resource-exhausted", "Ссылка больше не действует.");
+
+  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
+  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
+
+  if (!pick) {
+    if (found.size > 1) {
+      return { accounts: found.docs.map(d => ({
+        uid: d.id, nick: d.data().nick || "", name: d.data().name || ""
+      })) };
+    }
+    return await giveBadgeTo(ref, link, found.docs[0]);
+  }
+
+  const target = found.docs.find(d => d.id === pick);
+  if (!target) throw new HttpsError("permission-denied", "Этот аккаунт не связан с указанной почтой.");
+  return await giveBadgeTo(ref, link, target);
+});
+
+/* ============ БАЛЛЫ: КОДЫ И МАГАЗИН ============ */
+const BONUS_ABC = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; /* без O/0, I/1/L */
+function genBonusCode(){
+  const b = crypto.randomBytes(8);
+  let s = "";
+  for (let i = 0; i < 8; i++) s += BONUS_ABC[b[i] % BONUS_ABC.length];
+  return s.slice(0, 4) + "-" + s.slice(4);
+}
+
+exports.createBonusCodes = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const isAdmin = (await db.collection("admins").doc(uid).get()).exists;
+  if (!isAdmin) throw new HttpsError("permission-denied", "Только для админов.");
+
+  const batch = String((req.data && req.data.batch) || "").trim().slice(0, 40);
+  const values = Array.isArray(req.data && req.data.values) ? req.data.values : [];
+  if (!batch) throw new HttpsError("invalid-argument", "Дайте название пачке.");
+  if (!values.length || values.length > 50) throw new HttpsError("invalid-argument", "Кодов: от 1 до 50.");
+
+  const out = [];
+  const wb = db.batch();
+  for (const v of values) {
+    const pts = Number(v);
+    if (!Number.isInteger(pts) || pts < 1 || pts > 100000) {
+      throw new HttpsError("invalid-argument", "Баллы: целое число от 1 до 100000.");
+    }
+    const code = genBonusCode();
+    wb.set(db.collection("bonusCodes").doc(code), {
+      points: pts, batch,
+      createdBy: uid, createdAt: FieldValue.serverTimestamp(),
+      claimedBy: null
+    });
+    out.push({ code, points: pts });
+  }
+  await wb.commit();
+  return { codes: out };
+});
+
+async function creditBonus(ref, uid){
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Такого кода нет.");
+    const d = snap.data();
+    if (d.claimedBy) throw new HttpsError("resource-exhausted", "Код уже использован.");
+    t.update(ref, { claimedBy: uid, claimedAt: FieldValue.serverTimestamp() });
+    t.update(db.collection("users").doc(uid), { points: FieldValue.increment(d.points) });
+    return d.points;
+  });
+}
+
+exports.claimBonusCode = onCall(async (req) => {
+  const raw = String((req.data && req.data.code) || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const code = raw.length === 8 ? raw.slice(0, 4) + "-" + raw.slice(4) : "";
+  const mail = String((req.data && req.data.mail) || "").trim().toLowerCase();
+  const pick = String((req.data && req.data.uid) || "").trim();
+
+  if (!code) throw new HttpsError("invalid-argument", "Код выглядит неверно — в нём 8 символов.");
+
+  const ref = db.collection("bonusCodes").doc(code);
+  const pre = await ref.get();
+  if (!pre.exists) throw new HttpsError("not-found", "Такого кода нет.");
+  if (pre.data().claimedBy) throw new HttpsError("resource-exhausted", "Код уже использован.");
+
+  /* вызов из приложения: человек уже вошёл, почта не нужна */
+  const authUid = req.auth && req.auth.uid;
+  if (authUid && !mail) {
+    const us = await db.collection("users").doc(authUid).get();
+    if (!us.exists) throw new HttpsError("not-found", "Аккаунт не найден.");
+    const pts = await creditBonus(ref, authUid);
+    return { success: true, points: pts };
+  }
+
+  /* вызов со страницы kwora.ru/bonus/ — по почте */
+  if (!mail) throw new HttpsError("invalid-argument", "Введите почту.");
+
+  const found = await db.collection("users").where("mailLow", "==", mail).limit(10).get();
+  if (found.empty) throw new HttpsError("not-found", "Аккаунтов с такой почтой нет.");
+
+  if (!pick && found.size > 1) {
+    return { accounts: found.docs.map(d => ({
+      uid: d.id, nick: d.data().nick || "", name: d.data().name || ""
+    })) };
+  }
+  const target = pick ? found.docs.find(d => d.id === pick) : found.docs[0];
+  if (!target) throw new HttpsError("permission-denied", "Этот аккаунт не связан с указанной почтой.");
+
+  const pts = await creditBonus(ref, target.id);
+  return { success: true, points: pts };
+});
+
+exports.shopBuy = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+  const item = String((req.data && req.data.item) || "").trim();
+  if (!item) throw new HttpsError("invalid-argument", "Не выбран товар.");
+
+  const iref = db.collection("shopItems").doc(item);
+  const uref = db.collection("users").doc(uid);
+
+  const left = await db.runTransaction(async (t) => {
+    const isnap = await t.get(iref);
+    const usnap = await t.get(uref);
+    if (!isnap.exists) throw new HttpsError("not-found", "Товар не найден.");
+    if (!usnap.exists) throw new HttpsError("not-found", "Аккаунт не найден.");
+    const it = isnap.data();
+    const u = usnap.data();
+    const limited = it.left !== null && it.left !== undefined;
+    if (limited && it.left <= 0) throw new HttpsError("resource-exhausted", "Товар закончился.");
+    const pts = u.points || 0;
+    if (pts < it.price) throw new HttpsError("failed-precondition", "Не хватает баллов.");
+    if (it.type !== "badge") throw new HttpsError("invalid-argument", "Неизвестный тип товара.");
+    if ((u.badges || []).includes(it.badge)) throw new HttpsError("already-exists", "Этот значок уже есть.");
+
+    t.update(uref, {
+      points: FieldValue.increment(-it.price),
+      badges: FieldValue.arrayUnion(it.badge)
+    });
+    if (limited) t.update(iref, { left: FieldValue.increment(-1) });
+    return pts - it.price;
+  });
+
+  return { success: true, points: left };
+});
