@@ -1027,3 +1027,46 @@ exports.shopBuy = onCall(async (req) => {
 
   return { success: true, points: left };
 });
+
+exports.shopBuyNick = onCall(async (req) => {
+  const uid = req.auth && req.auth.uid;
+  if (!uid) throw new HttpsError("unauthenticated", "Нужен вход.");
+
+  const nick = String((req.data && req.data.nick) || "").trim().replace(/^@/, "");
+  const low = nick.toLowerCase();
+  if (!/^[a-z0-9_]{1,20}$/.test(low)) {
+    throw new HttpsError("invalid-argument", "Ник: 1–20 знаков, латиница, цифры и _");
+  }
+  const price = low.length === 1 ? 150000 : low.length === 2 ? 50000 : low.length === 3 ? 10000 : 5000;
+
+  const uref = db.collection("users").doc(uid);
+  const lockNew = db.collection("nicks").doc(low);
+
+  const oldLow = await db.runTransaction(async (t) => {
+    const us = await t.get(uref);
+    if (!us.exists) throw new HttpsError("not-found", "Аккаунт не найден.");
+    const u = us.data();
+    if (u.banned) throw new HttpsError("permission-denied", "Аккаунт заблокирован.");
+    if ((u.nickLow || "") === low) throw new HttpsError("already-exists", "Это и так твой ник.");
+
+    const l = await t.get(lockNew);
+    if (l.exists) throw new HttpsError("already-exists", "Такой ник занят.");
+    /* старые аккаунты могли появиться до замков — проверяем и по профилям */
+    const dup = await t.get(db.collection("users").where("nickLow", "==", low).limit(1));
+    if (!dup.empty) throw new HttpsError("already-exists", "Такой ник занят.");
+
+    if ((u.points || 0) < price) {
+      throw new HttpsError("failed-precondition", "Не хватает баллов: нужно " + price + ".");
+    }
+
+    t.set(lockNew, { at: Date.now(), uid });
+    t.update(uref, { nick, nickLow: low, points: FieldValue.increment(-price) });
+    return u.nickLow || "";
+  });
+
+  /* прежний ник освобождаем — замок снимаем после успешной покупки */
+  if (oldLow && oldLow !== low) {
+    await db.collection("nicks").doc(oldLow).delete().catch(() => {});
+  }
+  return { success: true, nick, price };
+});
